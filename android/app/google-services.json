@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "293170314814",
+    "project_id": "care-bridge-e3734",
+    "storage_bucket": "care-bridge-e3734.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:293170314814:android:149d054d9ea75f4e359b6f",
+        "android_client_info": {
+          "package_name": "com.carebridge"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCEbizg3jQgETJWqWhm6BfMA3SNW5g6ZdA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
