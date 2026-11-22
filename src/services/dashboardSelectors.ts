@@ -1,7 +1,7 @@
 // Pure selectors for the dashboard. No Firebase import: inputs are plain data
 // shaped like ARCHITECTURE_AND_DB.md §2, so these can be unit-tested directly.
 
-export type AppointmentStatus = 'SCHEDULED' | 'ATTEND' | 'COMPLETED' | 'CANCELLED';
+export type AppointmentStatus = 'SCHEDULED' | 'ATTEND' | 'COMPLETED' | 'CANCELLED' | 'MISSED';
 
 export interface AppointmentLike {
   id: string;
@@ -83,12 +83,18 @@ export function monthRange(date: Date): MonthRange {
   };
 }
 
-// Earliest upcoming appointment, ignoring COMPLETED and CANCELLED.
+// Earliest upcoming appointment, ignoring COMPLETED, CANCELLED, and MISSED.
 export function pickNextAppointment(appointments: readonly AppointmentLike[]): AppointmentLike | null {
   let best: AppointmentLike | null = null;
   let bestTime = Number.POSITIVE_INFINITY;
   for (const appointment of appointments) {
-    if (appointment.status === 'COMPLETED' || appointment.status === 'CANCELLED') continue;
+    if (
+      appointment.status === 'COMPLETED' ||
+      appointment.status === 'CANCELLED' ||
+      appointment.status === 'MISSED'
+    ) {
+      continue;
+    }
     const time = Date.parse(appointment.scheduledAt);
     if (Number.isNaN(time)) continue;
     if (time < bestTime) {

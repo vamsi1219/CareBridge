@@ -76,7 +76,7 @@ export interface CareTask {
 // medicalRecords, medicalBills). Dates are ISO strings / 'YYYY-MM-DD' / 'YYYY-MM'
 // as documented there. The doc does not list document ids, so `id` is added to
 // the top-level entities for local keying; it mirrors the Firestore doc id.
-export type AppointmentStatus = 'SCHEDULED' | 'ATTEND' | 'COMPLETED' | 'CANCELLED';
+export type AppointmentStatus = 'SCHEDULED' | 'ATTEND' | 'COMPLETED' | 'CANCELLED' | 'MISSED';
 
 export type VisitType = 'IN_PERSON' | 'TELECONSULT';
 
@@ -97,6 +97,21 @@ export interface Appointment {
   prepRecordIds: string[];
   actualAttendedById?: string;
   completionSummary?: string;
+  visitNotes?: string;
+  attachments?: RecordAttachment[];
+  completedAt?: string;
+  completedBy?: string;
+  completedByName?: string;
+  updatedBy?: string;
+  updatedByName?: string;
+  lastEditedStamp?: string;
+  version?: number;
+  parentAppointmentId?: string;
+  rescheduleCount?: number;
+  rescheduledBy?: string;
+  rescheduleReason?: string;
+  syncStatus?: 'SYNCED' | 'PENDING' | 'FAILED';
+  clientMutationId?: string;
   finalAmount?: number;
   finalPaidById?: string;
   cancellationReason?: string;

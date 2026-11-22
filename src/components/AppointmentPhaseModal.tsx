@@ -12,15 +12,22 @@ import {
 import { useAuth } from '../hooks/useAuth';
 import { usePermissions } from '../hooks/usePermissions';
 import {
+  AppointmentConflictError,
   cancelAppointment,
   completeAppointment,
+  markAppointmentMissed,
   reassignAttendee,
+  rescheduleAppointment,
+  revertAppointmentToScheduled,
   startAttend,
+  updateCompletedAppointment,
   type CompleteAppointmentInput,
 } from '../services/appointmentService';
 import type { Actor } from '../services/careCircleService';
 import { formatDateTime } from '../services/dashboardSelectors';
+import { localStore } from '../services/localStore';
 import { subscribeMedicalRecords } from '../services/recordsService';
+import DateTimePickerField from './DateTimePickerField';
 import { colors, tabularNums } from '../theme/colors';
 import type {
   Appointment,
@@ -49,6 +56,7 @@ export const APPOINTMENT_STATUS_LABEL: Record<AppointmentStatus, string> = {
   ATTEND: 'In progress (ATTEND)',
   COMPLETED: 'Completed',
   CANCELLED: 'Cancelled',
+  MISSED: 'Missed',
 };
 
 export const APPOINTMENT_STATUS_COLOR: Record<AppointmentStatus, string> = {
@@ -56,6 +64,7 @@ export const APPOINTMENT_STATUS_COLOR: Record<AppointmentStatus, string> = {
   ATTEND: colors.primary,
   COMPLETED: '#4338CA',
   CANCELLED: colors.textSecondary,
+  MISSED: colors.error,
 };
 
 export const VISIT_TYPE_LABEL: Record<VisitType, string> = {
@@ -270,8 +279,21 @@ export default function AppointmentPhaseModal({
   const [error, setError] = useState<string | null>(null);
   const [cancelReason, setCancelReason] = useState<string>('');
   const [cancelReasonError, setCancelReasonError] = useState<string | null>(null);
+  const [rescheduleAt, setRescheduleAt] = useState<string>('');
+  const [rescheduleReason, setRescheduleReason] = useState<string>('');
+  const [followUpEnabled, setFollowUpEnabled] = useState<boolean>(false);
+  const [followUpScheduledAt, setFollowUpScheduledAt] = useState<string>('');
+  const [extraNotes, setExtraNotes] = useState<string>('');
+  const [attachmentUrl, setAttachmentUrl] = useState<string>('');
+  const [editingCompleted, setEditingCompleted] = useState<boolean>(false);
+  const [conflictBanner, setConflictBanner] = useState<string | null>(null);
+  const [scheduleConflictNotice, setScheduleConflictNotice] = useState<string | null>(null);
+  const [openedVersion, setOpenedVersion] = useState<number | undefined>(undefined);
+  const [openedScheduledAt, setOpenedScheduledAt] = useState<string | null>(null);
   const [wrapUp, setWrapUp] = useState<WrapUpForm>(() => emptyWrapUp(''));
 
+  // Explicitly bind patientId to the selected appointment so global patient switching never misroutes writes.
+  const targetPatientId = appointment?.patientId ?? patientId;
   const appointmentId = appointment?.id ?? null;
   const actor: Actor | null = currentUser
     ? { uid: currentUser.id, name: currentUser.fullName }
@@ -292,22 +314,57 @@ export default function AppointmentPhaseModal({
 
   // Live medical records, used to resolve prepRecordIds while the modal is open.
   useEffect(() => {
-    if (!visible || !patientId) return undefined;
-    return subscribeMedicalRecords(patientId, items => {
+    if (!visible || !targetPatientId) return undefined;
+    return subscribeMedicalRecords(targetPatientId, items => {
       setRecords(items);
       setRecordsLoaded(true);
     });
-  }, [visible, patientId]);
+  }, [visible, targetPatientId]);
 
   // Reset local form state whenever a different appointment is opened.
   useEffect(() => {
     setError(null);
     setCancelReason('');
     setCancelReasonError(null);
-    setWrapUp(emptyWrapUp(appointment?.assignedAttendeeId ?? currentUser?.id ?? ''));
+    setRescheduleAt('');
+    setRescheduleReason('');
+    setFollowUpEnabled(false);
+    setFollowUpScheduledAt('');
+    setConflictBanner(null);
+    setScheduleConflictNotice(null);
+    setEditingCompleted(false);
+    setAttachmentUrl('');
+    setOpenedVersion(appointment?.version ?? 1);
+    setOpenedScheduledAt(appointment?.scheduledAt ?? null);
+    const savedDraft =
+      appointment && targetPatientId
+        ? localStore.getAppointmentDraftNotes(targetPatientId, appointment.id)
+        : '';
+    const form = emptyWrapUp(appointment?.assignedAttendeeId ?? currentUser?.id ?? '');
+    if (savedDraft) {
+      form.completionSummary = savedDraft;
+    }
+    setWrapUp(form);
+    setExtraNotes(
+      appointment?.visitNotes ?? appointment?.completionSummary ?? savedDraft ?? '',
+    );
     // Keyed on the id only: a status update to the same visit should not wipe the form.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appointmentId, visible]);
+
+  // Detect concurrent reschedule/cancel while user has unsaved draft notes.
+  useEffect(() => {
+    if (!visible || !appointment || !openedScheduledAt) return;
+    if (
+      appointment.scheduledAt !== openedScheduledAt &&
+      wrapUp.completionSummary.trim().length > 0
+    ) {
+      const who = appointment.updatedByName || 'Another caregiver';
+      setScheduleConflictNotice(
+        `${who} rescheduled this appointment to ${formatAppointmentTime(appointment.scheduledAt)}. Save notes to the rescheduled visit or discard?`,
+      );
+    }
+  }, [appointment, openedScheduledAt, visible, wrapUp.completionSummary]);
 
   const prepRecords = useMemo<MedicalRecord[]>(() => {
     if (!appointment) return [];
@@ -326,18 +383,33 @@ export default function AppointmentPhaseModal({
   }
 
   function patchWrapUp(patch: Partial<WrapUpForm>): void {
-    setWrapUp(prev => ({ ...prev, ...patch }));
+    setWrapUp(prev => {
+      const next = { ...prev, ...patch };
+      if (patch.completionSummary !== undefined && appointment && targetPatientId) {
+        localStore.saveAppointmentDraftNotes(
+          targetPatientId,
+          appointment.id,
+          patch.completionSummary,
+        );
+      }
+      return next;
+    });
   }
 
   // Runs one write. Returns true on success; thrown errors are shown inline.
   async function runAction(action: () => Promise<void>): Promise<boolean> {
     setBusy(true);
     setError(null);
+    setConflictBanner(null);
     try {
       await action();
       return true;
     } catch (err: unknown) {
-      setError(errorMessage(err));
+      if (err instanceof AppointmentConflictError && err.code === 'ALREADY_COMPLETED') {
+        setConflictBanner(err.message);
+      } else {
+        setError(errorMessage(err));
+      }
       return false;
     } finally {
       setBusy(false);
@@ -347,7 +419,7 @@ export default function AppointmentPhaseModal({
   async function handleStart(): Promise<void> {
     if (!appointment || !actor) return;
     const id = appointment.id;
-    await runAction(() => startAttend(patientId, id, actor));
+    await runAction(() => startAttend(targetPatientId, id, actor));
   }
 
   async function handleCancel(): Promise<void> {
@@ -359,14 +431,73 @@ export default function AppointmentPhaseModal({
       return;
     }
     setCancelReasonError(null);
-    await runAction(() => cancelAppointment(patientId, id, actor, reason));
+    await runAction(() => cancelAppointment(targetPatientId, id, actor, reason));
+  }
+
+  async function handleReschedule(): Promise<void> {
+    if (!appointment || !actor) return;
+    if (!rescheduleAt || Number.isNaN(Date.parse(rescheduleAt))) {
+      setError('Pick a valid new date and time to reschedule.');
+      return;
+    }
+    const id = appointment.id;
+    await runAction(async () => {
+      await rescheduleAppointment(targetPatientId, id, actor, {
+        scheduledAt: rescheduleAt,
+        rescheduleReason: rescheduleReason.trim() || undefined,
+        expectedVersion: openedVersion,
+      });
+      setRescheduleAt('');
+      setRescheduleReason('');
+      setOpenedVersion((appointment.version ?? 1) + 1);
+    });
+  }
+
+  async function handleMarkMissed(): Promise<void> {
+    if (!appointment || !actor) return;
+    const id = appointment.id;
+    await runAction(() => markAppointmentMissed(targetPatientId, id, actor, openedVersion));
+  }
+
+  async function handleRevertToScheduled(): Promise<void> {
+    if (!appointment || !actor) return;
+    const id = appointment.id;
+    await runAction(() => revertAppointmentToScheduled(targetPatientId, id, actor));
+  }
+
+  async function handleSaveCompletedExtras(): Promise<void> {
+    if (!appointment || !actor) return;
+    const id = appointment.id;
+    const attachments = attachmentUrl.trim() ? [{ url: attachmentUrl.trim() }] : undefined;
+    const followUpAppointment =
+      followUpEnabled && followUpScheduledAt && !Number.isNaN(Date.parse(followUpScheduledAt))
+        ? { scheduledAt: followUpScheduledAt }
+        : undefined;
+    if (followUpEnabled && !followUpAppointment) {
+      setError('Pick a valid follow-up date & time or turn off the follow-up toggle.');
+      return;
+    }
+    await runAction(async () => {
+      const res = await updateCompletedAppointment(targetPatientId, id, actor, {
+        visitNotes: extraNotes,
+        attachments,
+        followUpAppointment,
+      });
+      if (res.rejectedAttachments > 0) {
+        setError('Notes saved, but an attachment failed type/size validation.');
+      }
+      setEditingCompleted(false);
+      setAttachmentUrl('');
+      setFollowUpEnabled(false);
+      setFollowUpScheduledAt('');
+    });
   }
 
   async function handleReassign(option: AttendeeOption): Promise<void> {
     if (!appointment || !actor) return;
     if (option.id === appointment.assignedAttendeeId) return;
     const id = appointment.id;
-    await runAction(() => reassignAttendee(patientId, id, actor, option.id));
+    await runAction(() => reassignAttendee(targetPatientId, id, actor, option.id));
   }
 
   async function handleComplete(): Promise<void> {
@@ -422,26 +553,43 @@ export default function AppointmentPhaseModal({
       return;
     }
 
+    const followUpAppointment =
+      followUpEnabled && followUpScheduledAt && !Number.isNaN(Date.parse(followUpScheduledAt))
+        ? { scheduledAt: followUpScheduledAt }
+        : undefined;
+
     const input: CompleteAppointmentInput = {
       actualAttendedById,
       completionSummary: wrapUp.completionSummary.trim() || undefined,
+      visitNotes: wrapUp.completionSummary.trim() || undefined,
       finalAmount,
       finalPaidById: finalPaidById || undefined,
+      expectedVersion: openedVersion,
+      clientMutationId: `mut_${id}_${Date.now()}`,
+      attachments: attachmentUrl.trim() ? [{ url: attachmentUrl.trim() }] : undefined,
       createRecord,
       followUpTitle: wrapUp.followUpTitle.trim() || undefined,
       followUpDueDate: followUpDueDate || undefined,
+      followUpAppointment,
     };
-    await runAction(() => completeAppointment(patientId, id, actor, input));
+    await runAction(async () => {
+      const res = await completeAppointment(targetPatientId, id, actor, input);
+      if (res.rejectedAttachments > 0) {
+        setError('Visit completed, but an attachment failed validation.');
+      }
+    });
   }
 
   async function handleQuickComplete(): Promise<void> {
     if (!appointment || !actor) return;
     const id = appointment.id;
-    await runAction(() =>
-      completeAppointment(patientId, id, actor, {
+    await runAction(async () => {
+      await completeAppointment(targetPatientId, id, actor, {
         actualAttendedById: appointment.assignedAttendeeId || actor.uid,
-      }),
-    );
+        expectedVersion: openedVersion,
+        clientMutationId: `mut_${id}_${Date.now()}`,
+      });
+    });
   }
 
   function renderDetails(current: Appointment): React.JSX.Element {
@@ -502,6 +650,33 @@ export default function AppointmentPhaseModal({
               ))}
             </View>
           )}
+        </Section>
+        <Section title="Reschedule or mark missed">
+          <DateTimePickerField
+            label="New date and time"
+            value={rescheduleAt}
+            onChange={setRescheduleAt}
+            mode="datetime"
+          />
+          <Field
+            label="Reschedule reason (optional)"
+            value={rescheduleReason}
+            onChangeText={setRescheduleReason}
+            editable={editable}
+            placeholder="e.g. Doctor delayed"
+          />
+          <ActionButton
+            label="Reschedule appointment"
+            onPress={() => void handleReschedule()}
+            disabled={!editable}
+          />
+          <View style={{ height: 8 }} />
+          <ActionButton
+            label="Missed / Didn't Happen"
+            tone="danger"
+            onPress={() => void handleMarkMissed()}
+            disabled={!editable}
+          />
         </Section>
         <Section title="Cancel appointment">
           <Field
@@ -700,28 +875,125 @@ export default function AppointmentPhaseModal({
 
   function renderClosed(current: Appointment): React.JSX.Element {
     const isCancelled = current.status === 'CANCELLED';
+    const isMissed = current.status === 'MISSED';
+    const hasNotes = Boolean(current.visitNotes?.trim() || current.completionSummary?.trim());
     return (
       <>
         {renderDetails(current)}
         <Section title="Summary">
           {isCancelled ? (
             <Row label="Cancellation reason" value={current.cancellationReason ?? 'Not recorded'} />
+          ) : isMissed ? (
+            <Text style={styles.muted}>This appointment was marked as Missed / Didn't happen.</Text>
           ) : (
             <>
               <Row label="Attended by" value={labelFor(current.actualAttendedById)} />
+              {current.completedByName ? (
+                <Row label="Completed by" value={current.completedByName} />
+              ) : null}
+              {current.completedAt ? (
+                <Row label="Completed at" value={formatAppointmentTime(current.completedAt)} tabular />
+              ) : null}
+              {current.lastEditedStamp ? (
+                <Row label="Last updated" value={current.lastEditedStamp} />
+              ) : null}
               <Row
-                label="Completion summary"
-                value={current.completionSummary ?? 'Not recorded'}
+                label="Visit notes"
+                value={current.visitNotes ?? current.completionSummary ?? 'Not recorded'}
               />
+              {!hasNotes && editable ? (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => setEditingCompleted(true)}
+                  style={styles.pillPrompt}
+                >
+                  <Text style={styles.pillPromptText}>Add visit notes later</Text>
+                </Pressable>
+              ) : null}
               <Row
                 label="Final amount"
                 value={current.finalAmount !== undefined ? formatRupees(current.finalAmount) : 'Not recorded'}
                 tabular
               />
               <Row label="Paid by" value={labelFor(current.finalPaidById)} />
+              {current.attachments && current.attachments.length > 0 ? (
+                <Row label="Attachments" value={`${current.attachments.length} file(s)`} />
+              ) : null}
             </>
           )}
         </Section>
+
+        {current.status === 'COMPLETED' && editable ? (
+          <Section title="Update completed visit">
+            {editingCompleted ? (
+              <>
+                <Field
+                  label="Visit notes"
+                  value={extraNotes}
+                  onChangeText={setExtraNotes}
+                  editable={!busy}
+                  multiline
+                  placeholder="Add lab findings, doctor instructions, etc."
+                />
+                <Field
+                  label="Attachment URL (optional)"
+                  value={attachmentUrl}
+                  onChangeText={setAttachmentUrl}
+                  editable={!busy}
+                  placeholder="https://... or file://..."
+                />
+                <Pressable
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: followUpEnabled, disabled: busy }}
+                  disabled={busy}
+                  onPress={() => setFollowUpEnabled(prev => !prev)}
+                  style={styles.checkboxRow}
+                >
+                  <View style={[styles.checkbox, followUpEnabled && styles.checkboxOn]}>
+                    <Text style={styles.checkboxMark}>{followUpEnabled ? '✓' : ''}</Text>
+                  </View>
+                  <Text style={styles.checkboxLabel}>Schedule a follow-up visit</Text>
+                </Pressable>
+                {followUpEnabled ? (
+                  <DateTimePickerField
+                    label="Follow-up date and time"
+                    value={followUpScheduledAt}
+                    onChange={setFollowUpScheduledAt}
+                    mode="datetime"
+                  />
+                ) : null}
+                <ActionButton
+                  label="Save extra notes"
+                  onPress={() => void handleSaveCompletedExtras()}
+                  disabled={busy}
+                />
+              </>
+            ) : (
+              <ActionButton
+                label="View / Add Extra Notes"
+                onPress={() => setEditingCompleted(true)}
+                disabled={busy}
+              />
+            )}
+            <View style={{ height: 8 }} />
+            <ActionButton
+              label="Revert to Scheduled (Undo)"
+              tone="danger"
+              onPress={() => void handleRevertToScheduled()}
+              disabled={busy}
+            />
+          </Section>
+        ) : null}
+
+        {isMissed && editable ? (
+          <Section title="Reopen visit">
+            <ActionButton
+              label="Revert to Scheduled"
+              onPress={() => void handleRevertToScheduled()}
+              disabled={busy}
+            />
+          </Section>
+        ) : null}
       </>
     );
   }
@@ -735,6 +1007,7 @@ export default function AppointmentPhaseModal({
         return renderAttend(appointment);
       case 'COMPLETED':
       case 'CANCELLED':
+      case 'MISSED':
         return renderClosed(appointment);
       default:
         return null;
@@ -768,6 +1041,39 @@ export default function AppointmentPhaseModal({
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
           {showPermissionNote && showReadOnlyNote ? (
             <Text style={styles.readOnlyNote}>{READ_ONLY_MESSAGE}</Text>
+          ) : null}
+          {conflictBanner ? (
+            <View style={styles.section}>
+              <Text style={styles.errorText}>{conflictBanner}</Text>
+              {editable ? (
+                <ActionButton
+                  label="View / Add Extra Notes"
+                  onPress={() => {
+                    setConflictBanner(null);
+                    setEditingCompleted(true);
+                  }}
+                  disabled={busy}
+                />
+              ) : null}
+            </View>
+          ) : null}
+          {scheduleConflictNotice ? (
+            <View style={styles.section}>
+              <Text style={styles.errorText}>{scheduleConflictNotice}</Text>
+              <ActionButton
+                label="Discard Draft Notes"
+                tone="danger"
+                onPress={() => {
+                  if (appointment) {
+                    localStore.saveAppointmentDraftNotes(targetPatientId, appointment.id, '');
+                  }
+                  patchWrapUp({ completionSummary: '' });
+                  setScheduleConflictNotice(null);
+                  setOpenedScheduledAt(appointment?.scheduledAt ?? null);
+                }}
+                disabled={busy}
+              />
+            </View>
           ) : null}
           {permissionsLoading && showPermissionNote ? (
             <Text style={styles.muted}>Checking your permissions…</Text>
@@ -997,5 +1303,21 @@ const styles = StyleSheet.create({
   },
   disabled: {
     opacity: 0.5,
+  },
+  pillPrompt: {
+    alignSelf: 'flex-start',
+    marginTop: 6,
+    marginBottom: 6,
+    borderWidth: 1,
+    borderColor: colors.amber,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: '#FFFBEB',
+  },
+  pillPromptText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.amber,
   },
 });

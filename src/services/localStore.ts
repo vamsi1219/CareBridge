@@ -26,6 +26,18 @@ const billsByPatient = new Map<string, MedicalBill[]>();
 const prescriptionsByPatient = new Map<string, Map<string, Prescription>>();
 const activePatientByUser = new Map<string, string>();
 const addingPatientByUser = new Map<string, boolean>();
+const appointmentDraftNotes = new Map<string, string>();
+const processedMutationIds = new Set<string>();
+const pendingOfflineMutations = new Map<
+  string,
+  {
+    clientMutationId: string;
+    patientId: string;
+    appointmentId: string;
+    type: 'COMPLETE' | 'UPDATE_NOTES' | 'RESCHEDULE' | 'MISSED' | 'REVERT';
+    createdAt: string;
+  }
+>();
 
 type Listener = () => void;
 const memberListeners = new Map<string, Set<Listener>>();
@@ -200,6 +212,9 @@ export const localStore = {
     prescriptionsByPatient.clear();
     activePatientByUser.clear();
     addingPatientByUser.clear();
+    appointmentDraftNotes.clear();
+    processedMutationIds.clear();
+    pendingOfflineMutations.clear();
   },
 
   findPatientIdForUser(uid: string): string | null {
@@ -399,6 +414,43 @@ export const localStore = {
   getAppointments(patientId: string): Appointment[] {
     const map = appointmentsByPatient.get(patientId);
     return map ? Array.from(map.values()) : [];
+  },
+
+  saveAppointmentDraftNotes(patientId: string, appointmentId: string, notes: string): void {
+    const key = `${patientId}:${appointmentId}`;
+    if (notes) {
+      appointmentDraftNotes.set(key, notes);
+    } else {
+      appointmentDraftNotes.delete(key);
+    }
+  },
+
+  getAppointmentDraftNotes(patientId: string, appointmentId: string): string {
+    return appointmentDraftNotes.get(`${patientId}:${appointmentId}`) ?? '';
+  },
+
+  hasProcessedMutation(clientMutationId: string): boolean {
+    return processedMutationIds.has(clientMutationId);
+  },
+
+  markMutationProcessed(clientMutationId: string): void {
+    processedMutationIds.add(clientMutationId);
+    pendingOfflineMutations.delete(clientMutationId);
+  },
+
+  queueOfflineMutation(entry: {
+    clientMutationId: string;
+    patientId: string;
+    appointmentId: string;
+    type: 'COMPLETE' | 'UPDATE_NOTES' | 'RESCHEDULE' | 'MISSED' | 'REVERT';
+    createdAt: string;
+  }): void {
+    pendingOfflineMutations.set(entry.clientMutationId, entry);
+  },
+
+  getPendingOfflineMutations(patientId?: string) {
+    const all = Array.from(pendingOfflineMutations.values());
+    return patientId ? all.filter(m => m.patientId === patientId) : all;
   },
 
   onAppointmentsChange(patientId: string, fn: Listener): () => void {

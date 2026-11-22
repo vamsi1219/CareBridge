@@ -22,12 +22,34 @@ import type {
   CareTask,
   MedicalBill,
   MedicalRecord,
+  RecordAttachment,
   RecordType,
   VisitType,
 } from '../types/carebridge';
+import { normalizeImageAsset, validateImageAsset } from '../utils/imageCompression';
 import type { Actor } from './careCircleService';
 import { localStore, withTimeout } from './localStore';
+import {
+  cancelAppointmentReminder,
+  scheduleAppointmentReminder,
+} from './notificationService';
 import { getCapabilities } from './permissions';
+
+export class AppointmentConflictError extends Error {
+  code: 'ALREADY_COMPLETED' | 'STALE_VERSION';
+  current: Appointment;
+
+  constructor(
+    code: 'ALREADY_COMPLETED' | 'STALE_VERSION',
+    message: string,
+    current: Appointment,
+  ) {
+    super(message);
+    this.name = 'AppointmentConflictError';
+    this.code = code;
+    this.current = current;
+  }
+}
 
 export interface CreateAppointmentInput {
   hospitalName: string;
@@ -44,11 +66,32 @@ export interface CreateAppointmentInput {
   prepRecordIds: string[];
 }
 
+export interface FollowUpAppointmentInput {
+  hospitalName?: string;
+  doctorName?: string;
+  visitType?: VisitType;
+  /** ISO date-time string */
+  scheduledAt: string;
+  assignedAttendeeId?: string;
+}
+
+export interface AttachmentInput {
+  url: string;
+  label?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+}
+
 export interface CompleteAppointmentInput {
   actualAttendedById: string;
   completionSummary?: string;
+  visitNotes?: string;
   finalAmount?: number;
   finalPaidById?: string;
+  expectedVersion?: number;
+  clientMutationId?: string;
+  simulateOffline?: boolean;
+  attachments?: AttachmentInput[];
   createRecord?: {
     title: string;
     recordType: RecordType;
@@ -59,6 +102,20 @@ export interface CompleteAppointmentInput {
   followUpTitle?: string;
   /** 'YYYY-MM-DD' */
   followUpDueDate?: string;
+  followUpAppointment?: FollowUpAppointmentInput;
+}
+
+export interface RescheduleAppointmentInput {
+  scheduledAt: string;
+  rescheduleReason?: string;
+  expectedVersion?: number;
+}
+
+export interface UpdateCompletedAppointmentInput {
+  visitNotes?: string;
+  attachments?: AttachmentInput[];
+  followUpAppointment?: FollowUpAppointmentInput;
+  expectedVersion?: number;
 }
 
 type ActivityInput = Pick<
@@ -100,9 +157,122 @@ function toAppointment(snap: { id: string; data: () => DocumentData | undefined 
 // Local calendar date (YYYY-MM-DD) of an ISO date-time, used for bill and summary dates.
 function toLocalDate(iso: string): string {
   const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   const dd = String(d.getDate()).padStart(2, '0');
   return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+function formatShortTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const hh = String(d.getHours()).padStart(2, '0');
+  const min = String(d.getMinutes()).padStart(2, '0');
+  return `${toLocalDate(iso)} ${hh}:${min}`;
+}
+
+function assertOptimisticVersion(
+  current: Appointment,
+  expectedVersion: number | undefined,
+): void {
+  if (expectedVersion === undefined) return;
+  const currentVersion = current.version ?? 1;
+  if (currentVersion === expectedVersion) return;
+
+  if (current.status === 'COMPLETED') {
+    const who = current.completedByName || current.completedBy || 'Another caregiver';
+    const when = formatShortTime(current.completedAt || current.updatedAt);
+    throw new AppointmentConflictError(
+      'ALREADY_COMPLETED',
+      `Already marked Completed by ${who} at ${when}.`,
+      current,
+    );
+  }
+  const who = current.updatedByName || current.updatedBy || 'Another caregiver';
+  throw new AppointmentConflictError(
+    'STALE_VERSION',
+    `${who} updated this appointment (${current.status} · ${formatShortTime(current.scheduledAt)}).`,
+    current,
+  );
+}
+
+function validateAndNormalizeAttachments(
+  inputs: AttachmentInput[] | undefined,
+  now: string,
+): { valid: RecordAttachment[]; rejectedCount: number } {
+  if (!inputs || inputs.length === 0) return { valid: [], rejectedCount: 0 };
+  const valid: RecordAttachment[] = [];
+  let rejectedCount = 0;
+  for (const item of inputs) {
+    const assetInput = {
+      uri: item.url,
+      type: item.mimeType,
+      fileSize: item.sizeBytes,
+    };
+    const check = validateImageAsset(assetInput);
+    if (!check.ok) {
+      rejectedCount += 1;
+      continue;
+    }
+    const normalized = normalizeImageAsset(assetInput);
+    const attachment: RecordAttachment = {
+      url: normalized.uri,
+      uploadedAt: now,
+    };
+    if (item.label?.trim()) {
+      attachment.label = item.label.trim();
+    }
+    valid.push(attachment);
+  }
+  return { valid, rejectedCount };
+}
+
+function queueFollowUpChildAppointment(
+  batch: WriteBatch,
+  patientId: string,
+  parent: Appointment,
+  actor: Actor,
+  followUp: FollowUpAppointmentInput,
+  now: string,
+): string | null {
+  const raw = followUp.scheduledAt?.trim();
+  if (!raw || Number.isNaN(Date.parse(raw))) {
+    return null;
+  }
+  const scheduledAt = new Date(raw).toISOString();
+  const childRef = doc(collection(db, 'patients', patientId, 'appointments'));
+  const child: Appointment = {
+    id: childRef.id,
+    patientId,
+    hospitalName: followUp.hospitalName?.trim() || parent.hospitalName,
+    doctorName: followUp.doctorName?.trim() || parent.doctorName,
+    specialty: parent.specialty,
+    visitType: followUp.visitType ?? parent.visitType,
+    scheduledAt,
+    status: 'SCHEDULED',
+    bookedByUserId: actor.uid,
+    assignedAttendeeId: followUp.assignedAttendeeId ?? parent.assignedAttendeeId,
+    prepRecordIds: [],
+    parentAppointmentId: parent.id,
+    version: 1,
+    syncStatus: 'SYNCED',
+    createdAt: now,
+    updatedAt: now,
+  };
+  batch.set(childRef, {
+    ...child,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+  localStore.upsertAppointment(patientId, child);
+  scheduleAppointmentReminder({
+    appointmentId: child.id,
+    patientId,
+    hospitalName: child.hospitalName,
+    scheduledAt: child.scheduledAt,
+    assignedAttendeeId: child.assignedAttendeeId,
+  });
+  return child.id;
 }
 
 function sortByScheduledAt(list: Appointment[]): Appointment[] {
@@ -251,6 +421,10 @@ export async function createAppointment(
     status: 'SCHEDULED',
     bookedByUserId: input.bookedByUserId,
     prepRecordIds: [...input.prepRecordIds],
+    version: 1,
+    syncStatus: 'SYNCED',
+    updatedBy: actor.uid,
+    updatedByName: actor.name,
     createdAt: now,
     updatedAt: now,
   };
@@ -301,6 +475,13 @@ export async function createAppointment(
   );
 
   localStore.upsertAppointment(patientId, appointment);
+  scheduleAppointmentReminder({
+    appointmentId: ref.id,
+    patientId,
+    hospitalName,
+    scheduledAt,
+    assignedAttendeeId: appointment.assignedAttendeeId,
+  });
   await commitBatch(batch, 'Scheduling the appointment');
   return ref.id;
 }
@@ -397,11 +578,23 @@ export async function completeAppointment(
   appointmentId: string,
   actor: Actor,
   input?: Partial<CompleteAppointmentInput>,
-): Promise<void> {
+): Promise<{ rejectedAttachments: number; childAppointmentId: string | null }> {
+  if (input?.clientMutationId && localStore.hasProcessedMutation(input.clientMutationId)) {
+    return { rejectedAttachments: 0, childAppointmentId: null };
+  }
+
   // Status check is a plain read followed by a batch write, not a transaction.
   const current = await readAppointment(patientId, appointmentId);
+  assertOptimisticVersion(current, input?.expectedVersion);
+
   if (current.status === 'COMPLETED') {
-    throw new Error('This appointment is already completed.');
+    const who = current.completedByName || current.completedBy || 'Another caregiver';
+    const when = formatShortTime(current.completedAt || current.updatedAt);
+    throw new AppointmentConflictError(
+      'ALREADY_COMPLETED',
+      `Already marked Completed by ${who} at ${when}.`,
+      current,
+    );
   }
   if (current.status === 'CANCELLED') {
     throw new Error('A cancelled appointment cannot be completed.');
@@ -418,12 +611,15 @@ export async function completeAppointment(
   const resolvedInput: CompleteAppointmentInput = {
     actualAttendedById:
       input?.actualAttendedById?.trim() || current.assignedAttendeeId || actor.uid,
-    completionSummary: input?.completionSummary,
+    completionSummary: input?.completionSummary ?? input?.visitNotes,
+    visitNotes: input?.visitNotes ?? input?.completionSummary,
     finalAmount: input?.finalAmount,
     finalPaidById: input?.finalPaidById,
     createRecord: input?.createRecord,
     followUpTitle: input?.followUpTitle,
     followUpDueDate: input?.followUpDueDate,
+    followUpAppointment: input?.followUpAppointment,
+    attachments: input?.attachments,
   };
 
   const actualAttendedById = resolvedInput.actualAttendedById.trim();
@@ -453,13 +649,52 @@ export async function completeAppointment(
   }
 
   const now = new Date().toISOString();
-  const changes: Partial<Appointment> = { status: 'COMPLETED', actualAttendedById };
-  const completionSummary = resolvedInput.completionSummary?.trim();
-  if (completionSummary) changes.completionSummary = completionSummary;
+  const nextVersion = (current.version ?? 1) + 1;
+  const { valid: validAttachments, rejectedCount } = validateAndNormalizeAttachments(
+    resolvedInput.attachments,
+    now,
+  );
+  const mergedAttachments = [...(current.attachments ?? []), ...validAttachments];
+
+  const changes: Partial<Appointment> = {
+    status: 'COMPLETED',
+    actualAttendedById,
+    completedAt: now,
+    completedBy: actor.uid,
+    completedByName: actor.name,
+    updatedBy: actor.uid,
+    updatedByName: actor.name,
+    version: nextVersion,
+    syncStatus: input?.simulateOffline ? 'PENDING' : 'SYNCED',
+  };
+  if (input?.clientMutationId) {
+    changes.clientMutationId = input.clientMutationId;
+  }
+  const visitNotes = resolvedInput.visitNotes?.trim();
+  if (visitNotes) {
+    changes.completionSummary = visitNotes;
+    changes.visitNotes = visitNotes;
+  }
+  if (mergedAttachments.length > 0) {
+    changes.attachments = mergedAttachments;
+  }
   if (finalAmount !== undefined) changes.finalAmount = finalAmount;
   if (finalPaidById) changes.finalPaidById = finalPaidById;
 
   localStore.upsertAppointment(patientId, { ...current, ...changes, updatedAt: now });
+  localStore.saveAppointmentDraftNotes(patientId, appointmentId, '');
+  cancelAppointmentReminder(appointmentId);
+
+  if (input?.simulateOffline && input.clientMutationId) {
+    localStore.queueOfflineMutation({
+      clientMutationId: input.clientMutationId,
+      patientId,
+      appointmentId,
+      type: 'COMPLETE',
+      createdAt: now,
+    });
+    return { rejectedAttachments: rejectedCount, childAppointmentId: null };
+  }
 
   const batch = writeBatch(db);
   batch.update(doc(db, 'patients', patientId, 'appointments', appointmentId), {
@@ -487,8 +722,7 @@ export async function completeAppointment(
       recordType: createRecord.recordType,
       title: recordTitle,
       recordDate: createRecord.recordDate,
-      // Attachments are inline objects; file upload is out of scope for this service.
-      attachments: [],
+      attachments: validAttachments,
       appointmentId,
       uploadedById: actor.uid,
       createdAt: now,
@@ -516,6 +750,18 @@ export async function completeAppointment(
     localStore.upsertTask(patientId, task);
   }
 
+  let childAppointmentId: string | null = null;
+  if (resolvedInput.followUpAppointment) {
+    childAppointmentId = queueFollowUpChildAppointment(
+      batch,
+      patientId,
+      current,
+      actor,
+      resolvedInput.followUpAppointment,
+      now,
+    );
+  }
+
   queueActivityLog(
     batch,
     patientId,
@@ -531,6 +777,281 @@ export async function completeAppointment(
     now,
   );
   await commitBatch(batch, 'Completing the appointment');
+  if (input?.clientMutationId) {
+    localStore.markMutationProcessed(input.clientMutationId);
+  }
+  return { rejectedAttachments: rejectedCount, childAppointmentId };
+}
+
+export async function flushOfflineAppointmentMutation(
+  patientId: string,
+  appointmentId: string,
+  actor: Actor,
+  clientMutationId: string,
+): Promise<void> {
+  if (localStore.hasProcessedMutation(clientMutationId)) return;
+  const current = await readAppointment(patientId, appointmentId);
+  if (current.syncStatus !== 'PENDING') return;
+
+  const now = new Date().toISOString();
+  const synced: Appointment = { ...current, syncStatus: 'SYNCED', updatedAt: now };
+  localStore.upsertAppointment(patientId, synced);
+
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'patients', patientId, 'appointments', appointmentId), {
+    status: current.status,
+    syncStatus: 'SYNCED',
+    completedAt: current.completedAt,
+    completedBy: current.completedBy,
+    completedByName: current.completedByName,
+    visitNotes: current.visitNotes ?? current.completionSummary ?? '',
+    completionSummary: current.completionSummary ?? current.visitNotes ?? '',
+    updatedAt: serverTimestamp(),
+  });
+  await commitBatch(batch, 'Syncing appointment');
+  localStore.markMutationProcessed(clientMutationId);
+}
+
+export async function rescheduleAppointment(
+  patientId: string,
+  appointmentId: string,
+  actor: Actor,
+  input: RescheduleAppointmentInput,
+): Promise<void> {
+  await assertCanEdit(patientId, actor.uid);
+  if (Number.isNaN(Date.parse(input.scheduledAt))) {
+    throw new Error('New appointment time is not valid.');
+  }
+  const current = await readAppointment(patientId, appointmentId);
+  assertOptimisticVersion(current, input.expectedVersion);
+
+  if (current.status === 'COMPLETED' || current.status === 'CANCELLED') {
+    throw new Error('A completed or cancelled appointment cannot be rescheduled.');
+  }
+
+  const nextScheduledAt = new Date(input.scheduledAt).toISOString();
+  const now = new Date().toISOString();
+  const reason = input.rescheduleReason?.trim();
+  const changes: Partial<Appointment> = {
+    status: 'SCHEDULED',
+    scheduledAt: nextScheduledAt,
+    rescheduleCount: (current.rescheduleCount ?? 0) + 1,
+    rescheduledBy: actor.uid,
+    updatedBy: actor.uid,
+    updatedByName: actor.name,
+    version: (current.version ?? 1) + 1,
+    syncStatus: 'SYNCED',
+  };
+  if (reason) changes.rescheduleReason = reason;
+
+  localStore.upsertAppointment(patientId, { ...current, ...changes, updatedAt: now });
+  scheduleAppointmentReminder({
+    appointmentId,
+    patientId,
+    hospitalName: current.hospitalName,
+    scheduledAt: nextScheduledAt,
+    assignedAttendeeId: current.assignedAttendeeId,
+  });
+
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'patients', patientId, 'appointments', appointmentId), {
+    ...changes,
+    updatedAt: serverTimestamp(),
+  });
+  queueActivityLog(
+    batch,
+    patientId,
+    {
+      moduleName: 'APPOINTMENT',
+      actorUserId: actor.uid,
+      actorName: actor.name,
+      actionType: 'APPOINTMENT_RESCHEDULED',
+      entityType: 'appointment',
+      entityId: appointmentId,
+      summaryText: `${actor.name} rescheduled ${current.hospitalName} to ${formatShortTime(nextScheduledAt)}${reason ? ` (${reason})` : ''}`,
+    },
+    now,
+  );
+  await commitBatch(batch, 'Rescheduling the appointment');
+}
+
+export async function markAppointmentMissed(
+  patientId: string,
+  appointmentId: string,
+  actor: Actor,
+  expectedVersion?: number,
+): Promise<void> {
+  await assertCanEdit(patientId, actor.uid);
+  const current = await readAppointment(patientId, appointmentId);
+  assertOptimisticVersion(current, expectedVersion);
+
+  if (current.status === 'COMPLETED' || current.status === 'CANCELLED') {
+    throw new Error('A closed appointment cannot be marked missed.');
+  }
+
+  const now = new Date().toISOString();
+  const changes: Partial<Appointment> = {
+    status: 'MISSED',
+    updatedBy: actor.uid,
+    updatedByName: actor.name,
+    version: (current.version ?? 1) + 1,
+    syncStatus: 'SYNCED',
+  };
+  localStore.upsertAppointment(patientId, { ...current, ...changes, updatedAt: now });
+  cancelAppointmentReminder(appointmentId);
+
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'patients', patientId, 'appointments', appointmentId), {
+    ...changes,
+    updatedAt: serverTimestamp(),
+  });
+  queueActivityLog(
+    batch,
+    patientId,
+    {
+      moduleName: 'APPOINTMENT',
+      actorUserId: actor.uid,
+      actorName: actor.name,
+      actionType: 'APPOINTMENT_MISSED',
+      entityType: 'appointment',
+      entityId: appointmentId,
+      summaryText: `${actor.name} marked ${current.hospitalName} as missed`,
+    },
+    now,
+  );
+  await commitBatch(batch, 'Marking appointment missed');
+}
+
+export async function revertAppointmentToScheduled(
+  patientId: string,
+  appointmentId: string,
+  actor: Actor,
+): Promise<void> {
+  await assertCanEdit(patientId, actor.uid);
+  const current = await readAppointment(patientId, appointmentId);
+  if (current.status !== 'COMPLETED' && current.status !== 'MISSED') {
+    throw new Error('Only a completed or missed appointment can be reverted.');
+  }
+
+  const now = new Date().toISOString();
+  const changes: Partial<Appointment> = {
+    status: 'SCHEDULED',
+    updatedBy: actor.uid,
+    updatedByName: actor.name,
+    version: (current.version ?? 1) + 1,
+    syncStatus: 'SYNCED',
+  };
+  localStore.upsertAppointment(patientId, { ...current, ...changes, updatedAt: now });
+  if (Date.parse(current.scheduledAt) > Date.now()) {
+    scheduleAppointmentReminder({
+      appointmentId,
+      patientId,
+      hospitalName: current.hospitalName,
+      scheduledAt: current.scheduledAt,
+      assignedAttendeeId: current.assignedAttendeeId,
+    });
+  }
+
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'patients', patientId, 'appointments', appointmentId), {
+    ...changes,
+    updatedAt: serverTimestamp(),
+  });
+  queueActivityLog(
+    batch,
+    patientId,
+    {
+      moduleName: 'APPOINTMENT',
+      actorUserId: actor.uid,
+      actorName: actor.name,
+      actionType: 'APPOINTMENT_REVERTED',
+      entityType: 'appointment',
+      entityId: appointmentId,
+      summaryText: `${actor.name} reverted ${current.hospitalName} back to Scheduled`,
+    },
+    now,
+  );
+  await commitBatch(batch, 'Reverting the appointment');
+}
+
+export async function updateCompletedAppointment(
+  patientId: string,
+  appointmentId: string,
+  actor: Actor,
+  input: UpdateCompletedAppointmentInput,
+): Promise<{ rejectedAttachments: number; childAppointmentId: string | null }> {
+  await assertCanEdit(patientId, actor.uid);
+  const current = await readAppointment(patientId, appointmentId);
+  assertOptimisticVersion(current, input.expectedVersion);
+
+  if (current.status !== 'COMPLETED') {
+    throw new Error('Only a completed appointment can be updated here.');
+  }
+
+  const now = new Date().toISOString();
+  const { valid: validAttachments, rejectedCount } = validateAndNormalizeAttachments(
+    input.attachments,
+    now,
+  );
+  const mergedAttachments = [...(current.attachments ?? []), ...validAttachments];
+  const nextNotes = input.visitNotes?.trim();
+  const stamp = `Updated by ${actor.name} on ${toLocalDate(now)}`;
+
+  const changes: Partial<Appointment> = {
+    updatedBy: actor.uid,
+    updatedByName: actor.name,
+    lastEditedStamp: stamp,
+    version: (current.version ?? 1) + 1,
+    syncStatus: 'SYNCED',
+    // Preserve original completedBy & completedAt metadata.
+    completedBy: current.completedBy ?? current.actualAttendedById,
+    completedByName: current.completedByName,
+    completedAt: current.completedAt,
+  };
+  if (nextNotes !== undefined) {
+    changes.visitNotes = nextNotes;
+    changes.completionSummary = nextNotes;
+  }
+  if (mergedAttachments.length > 0) {
+    changes.attachments = mergedAttachments;
+  }
+
+  localStore.upsertAppointment(patientId, { ...current, ...changes, updatedAt: now });
+
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'patients', patientId, 'appointments', appointmentId), {
+    ...changes,
+    updatedAt: serverTimestamp(),
+  });
+
+  let childAppointmentId: string | null = null;
+  if (input.followUpAppointment) {
+    childAppointmentId = queueFollowUpChildAppointment(
+      batch,
+      patientId,
+      current,
+      actor,
+      input.followUpAppointment,
+      now,
+    );
+  }
+
+  queueActivityLog(
+    batch,
+    patientId,
+    {
+      moduleName: 'APPOINTMENT',
+      actorUserId: actor.uid,
+      actorName: actor.name,
+      actionType: 'APPOINTMENT_UPDATED',
+      entityType: 'appointment',
+      entityId: appointmentId,
+      summaryText: `${actor.name} updated notes for ${current.hospitalName}`,
+    },
+    now,
+  );
+  await commitBatch(batch, 'Updating the completed appointment');
+  return { rejectedAttachments: rejectedCount, childAppointmentId };
 }
 
 export async function cancelAppointment(
@@ -554,8 +1075,15 @@ export async function cancelAppointment(
   }
 
   const now = new Date().toISOString();
-  const changes: Partial<Appointment> = { status: 'CANCELLED', cancellationReason: reason };
+  const changes: Partial<Appointment> = {
+    status: 'CANCELLED',
+    cancellationReason: reason,
+    updatedBy: actor.uid,
+    updatedByName: actor.name,
+    version: (current.version ?? 1) + 1,
+  };
   localStore.upsertAppointment(patientId, { ...current, ...changes, updatedAt: now });
+  cancelAppointmentReminder(appointmentId);
 
   const batch = writeBatch(db);
   batch.update(doc(db, 'patients', patientId, 'appointments', appointmentId), {

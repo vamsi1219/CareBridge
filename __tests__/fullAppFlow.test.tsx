@@ -24,10 +24,17 @@ import {
   updateMemberRole,
 } from '../src/services/careCircleService';
 import {
+  AppointmentConflictError,
   completeAppointment,
   createAppointment,
+  flushOfflineAppointmentMutation,
+  markAppointmentMissed,
+  rescheduleAppointment,
+  revertAppointmentToScheduled,
   startAttend,
+  updateCompletedAppointment,
 } from '../src/services/appointmentService';
+import { getAppointmentReminder } from '../src/services/notificationService';
 import {
   addMedicalBill,
   filterBillsByCategory,
@@ -52,7 +59,7 @@ import {
   createMedicalRecord,
   createMonthlyCheckup,
 } from '../src/services/recordsService';
-import { extractPrescriptionFromImage } from '../src/config/gemini';
+import { extractPrescriptionDraft } from '../src/config/gemini';
 import { daysRemaining, durationBetween, isLowStock } from '../src/utils/durationCalculator';
 import { formatRupees, monthTotal, splitByPayer } from '../src/utils/expenseMath';
 import type { CareCircleMember, CareTask } from '../src/types/carebridge';
@@ -433,14 +440,20 @@ describe('CareBridge End-to-End Application Flow', () => {
       recordDate: '2026-11-10',
       checkupCycle: '2026-11',
       monthlyCheckupId: checkupId,
-      attachments: [{ url: 'https://carebridge.test/demo-lab.jpg', mimeType: 'image/jpeg' }],
+      attachments: [
+        {
+          url: 'https://carebridge.test/demo-lab.jpg',
+          label: 'Lab report',
+          uploadedAt: '2026-11-10T10:00:00.000Z',
+        },
+      ],
     });
     expect(typeof recordId).toBe('string');
     expect(localStore.getMedicalRecords(patientId).length).toBe(1);
 
     // B: AI Prescription Scan Extraction (sample fallback) -> Create Prescription -> Log Dose -> Auto-Refill Task -> Discontinue
-    const draft = await extractPrescriptionFromImage('https://carebridge.test/rx.jpg');
-    expect(draft.items.length).toBeGreaterThan(0);
+    const draft = await extractPrescriptionDraft('https://carebridge.test/rx.jpg');
+    expect(draft.medicineName.length).toBeGreaterThan(0);
 
     const prescriptionId = await createPrescription(patientId, actor, {
       prescribedByDoc: 'Dr. Kavitha Nair',
@@ -532,7 +545,129 @@ describe('CareBridge End-to-End Application Flow', () => {
     expect(localStore.getMedicalBills(patientId).length).toBeGreaterThanOrEqual(4);
   }, 25000);
 
-  test('5. UI Component tree mounts and transitions from Loading to LoginScreen cleanly', async () => {
+  test('5. Appointment edge cases: concurrency conflict, offline idempotency, reschedule in-place, missed, revert, edit completed, follow-up child & reminders', async () => {
+    const caregiver1 = await registerUserWithDummyOtp({
+      fullName: 'Kiran Rao',
+      phone: '9876543240',
+      email: 'kiran@carebridge.test',
+      city: 'Hyderabad',
+      relationshipLabel: 'Son',
+    });
+    const caregiver2 = await registerUserWithDummyOtp({
+      fullName: 'Divya Rao',
+      phone: '9876543241',
+      email: 'divya@carebridge.test',
+      city: 'Hyderabad',
+      relationshipLabel: 'Daughter',
+    });
+
+    const patientId = await createPatientWorkspace(caregiver1.id, {
+      fullName: 'Padma Rao',
+      relationshipLabel: 'Mother',
+      city: 'Hyderabad',
+      creatorName: caregiver1.fullName,
+      creatorPhone: caregiver1.phone,
+      creatorEmail: caregiver1.email,
+    });
+    await inviteMember(
+      patientId,
+      { uid: caregiver1.id, name: caregiver1.fullName },
+      {
+        invitedEmail: caregiver2.email,
+        invitedPhone: caregiver2.phone,
+        rolePreset: 'CO_CAREGIVER',
+        isBackupAdmin: false,
+        canViewFinancials: true,
+      },
+    );
+    const pending = await findPendingInvitationsForUser(caregiver2.phone, caregiver2.email);
+    await acceptInvitation(patientId, pending[0].member.id, caregiver2);
+
+    const actor1 = { uid: caregiver1.id, name: caregiver1.fullName };
+    const actor2 = { uid: caregiver2.id, name: caregiver2.fullName };
+
+    // 1. Schedule appointment & verify reminder job is created
+    const apptId = await createAppointment(patientId, actor1, {
+      hospitalName: 'KIMS Hospital',
+      doctorName: 'Dr. Mehta',
+      visitType: 'IN_PERSON',
+      scheduledAt: '2026-12-01T10:00:00.000Z',
+      bookedByUserId: caregiver1.id,
+      prepRecordIds: [],
+    });
+    expect(getAppointmentReminder(apptId)?.status).toBe('SCHEDULED');
+
+    // 2. Reschedule in place (same ID, rescheduleCount increments, reminder updates)
+    await rescheduleAppointment(patientId, apptId, actor1, {
+      scheduledAt: '2026-12-02T11:30:00.000Z',
+      rescheduleReason: 'Doctor shifted clinic hours',
+      expectedVersion: 1,
+    });
+    const rescheduled = localStore.getAppointments(patientId).find(a => a.id === apptId)!;
+    expect(rescheduled.rescheduleCount).toBe(1);
+    expect(rescheduled.version).toBe(2);
+    expect(getAppointmentReminder(apptId)?.scheduledAt).toBe('2026-12-02T11:30:00.000Z');
+
+    // 3. Offline completion with clientMutationId -> Syncing -> Flush idempotently
+    const mutationId = 'mut_offline_1';
+    await completeAppointment(patientId, apptId, actor1, {
+      actualAttendedById: caregiver1.id,
+      expectedVersion: 2,
+      clientMutationId: mutationId,
+      simulateOffline: true,
+      visitNotes: 'BP stable, continue tablets',
+    });
+    expect(localStore.getAppointments(patientId).find(a => a.id === apptId)?.syncStatus).toBe(
+      'PENDING',
+    );
+    expect(getAppointmentReminder(apptId)?.status).toBe('CANCELLED');
+    await flushOfflineAppointmentMutation(patientId, apptId, actor1, mutationId);
+    expect(localStore.getAppointments(patientId).find(a => a.id === apptId)?.syncStatus).toBe(
+      'SYNCED',
+    );
+
+    // 4. Concurrent completion by Caregiver 2 with stale version throws AppointmentConflictError
+    await expect(
+      completeAppointment(patientId, apptId, actor2, {
+        actualAttendedById: caregiver2.id,
+        expectedVersion: 2,
+      }),
+    ).rejects.toThrow(AppointmentConflictError);
+
+    // 5. Edit completed appointment later (preserves completedBy/completedAt, adds stamp, validates attachments, creates follow-up child)
+    const beforeUpdate = localStore.getAppointments(patientId).find(a => a.id === apptId)!;
+    const updateRes = await updateCompletedAppointment(patientId, apptId, actor2, {
+      visitNotes: 'BP stable, lab report normal',
+      attachments: [
+        { url: 'https://carebridge.test/lab.jpg', mimeType: 'image/jpeg', sizeBytes: 1024 },
+        { url: 'https://carebridge.test/bad.exe', mimeType: 'application/x-msdownload', sizeBytes: 1024 },
+      ],
+      followUpAppointment: { scheduledAt: '2026-12-20T09:00:00.000Z' },
+    });
+    expect(updateRes.rejectedAttachments).toBe(1);
+    expect(updateRes.childAppointmentId).toBeTruthy();
+
+    const afterUpdate = localStore.getAppointments(patientId).find(a => a.id === apptId)!;
+    expect(afterUpdate.completedBy).toBe(beforeUpdate.completedBy);
+    expect(afterUpdate.completedAt).toBe(beforeUpdate.completedAt);
+    expect(afterUpdate.attachments?.length).toBe(1);
+    expect(afterUpdate.lastEditedStamp).toContain('Updated by Divya Rao');
+    const child = localStore
+      .getAppointments(patientId)
+      .find(a => a.id === updateRes.childAppointmentId);
+    expect(child?.parentAppointmentId).toBe(apptId);
+    expect(child?.status).toBe('SCHEDULED');
+
+    // 6. Revert completed -> mark missed -> revert back to scheduled
+    await revertAppointmentToScheduled(patientId, apptId, actor1);
+    expect(localStore.getAppointments(patientId).find(a => a.id === apptId)?.status).toBe(
+      'SCHEDULED',
+    );
+    await markAppointmentMissed(patientId, apptId, actor1);
+    expect(localStore.getAppointments(patientId).find(a => a.id === apptId)?.status).toBe('MISSED');
+  }, 25000);
+
+  test('6. UI Component tree mounts and transitions from Loading to LoginScreen cleanly', async () => {
     let renderer: ReactTestRenderer.ReactTestRenderer | undefined;
     await act(async () => {
       renderer = ReactTestRenderer.create(<App />);

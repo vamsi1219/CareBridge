@@ -22,6 +22,8 @@ import { usePermissions } from '../hooks/usePermissions';
 import {
   completeAppointment,
   createAppointment,
+  markAppointmentMissed,
+  revertAppointmentToScheduled,
   subscribeAppointments,
   type CreateAppointmentInput,
 } from '../services/appointmentService';
@@ -168,8 +170,10 @@ interface AppointmentRowProps {
   isAssignedToMe: boolean;
   isAssignedToOther: boolean;
   canQuickComplete: boolean;
+  canEditActions: boolean;
   completing: boolean;
   onQuickComplete: () => void;
+  onMarkMissed?: () => void;
   onPress: () => void;
 }
 
@@ -179,11 +183,18 @@ function AppointmentRow({
   isAssignedToMe,
   isAssignedToOther,
   canQuickComplete,
+  canEditActions,
   completing,
   onQuickComplete,
+  onMarkMissed,
   onPress,
 }: AppointmentRowProps): React.JSX.Element {
   const isOpen = appointment.status === 'SCHEDULED' || appointment.status === 'ATTEND';
+  const isCompletedMissingNotes =
+    appointment.status === 'COMPLETED' &&
+    !appointment.visitNotes?.trim() &&
+    !appointment.completionSummary?.trim();
+  const isSyncing = appointment.syncStatus === 'PENDING';
   return (
     <View style={styles.row}>
       <Pressable
@@ -192,9 +203,12 @@ function AppointmentRow({
         onPress={onPress}>
         <View style={styles.rowTop}>
           <Text style={styles.rowTitle}>{appointment.hospitalName}</Text>
-          <Text style={[styles.statusChip, { color: APPOINTMENT_STATUS_COLOR[appointment.status] }]}>
-            {APPOINTMENT_STATUS_LABEL[appointment.status]}
-          </Text>
+          <View style={styles.chipCluster}>
+            {isSyncing ? <Text style={styles.syncBadge}>Syncing...</Text> : null}
+            <Text style={[styles.statusChip, { color: APPOINTMENT_STATUS_COLOR[appointment.status] }]}>
+              {APPOINTMENT_STATUS_LABEL[appointment.status]}
+            </Text>
+          </View>
         </View>
         <Text style={styles.rowMeta}>{appointment.doctorName ?? 'Doctor not set'}</Text>
         <Text style={styles.rowMeta}>{VISIT_TYPE_LABEL[appointment.visitType]}</Text>
@@ -207,18 +221,43 @@ function AppointmentRow({
             {`Assigned to ${attendeeLabel} — must be marked completed by ${attendeeLabel}`}
           </Text>
         ) : null}
+        {isCompletedMissingNotes && canEditActions ? (
+          <View style={styles.notesLaterPill}>
+            <Text style={styles.notesLaterText}>Add visit notes later</Text>
+          </View>
+        ) : null}
       </Pressable>
-      {isOpen && canQuickComplete ? (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityState={{ disabled: completing }}
-          disabled={completing}
-          onPress={onQuickComplete}
-          style={[styles.completeInlineButton, completing && styles.disabled]}>
-          <Text style={styles.completeInlineButtonText}>
-            {completing ? 'Completing…' : 'Mark as Completed'}
-          </Text>
-        </Pressable>
+      {isOpen && (canQuickComplete || (onMarkMissed && canEditActions)) ? (
+        <View style={styles.inlineActionRow}>
+          {canQuickComplete ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ disabled: completing }}
+              disabled={completing}
+              onPress={onQuickComplete}
+              style={[styles.completeInlineButton, completing && styles.disabled]}>
+              <Text style={styles.completeInlineButtonText}>
+                {completing ? 'Completing…' : 'Mark as Completed'}
+              </Text>
+            </Pressable>
+          ) : null}
+          {onMarkMissed && canEditActions ? (
+            <>
+              <Pressable
+                accessibilityRole="button"
+                onPress={onPress}
+                style={styles.secondaryInlineButton}>
+                <Text style={styles.secondaryInlineButtonText}>Reschedule</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                onPress={onMarkMissed}
+                style={styles.dangerInlineButton}>
+                <Text style={styles.dangerInlineButtonText}>Missed</Text>
+              </Pressable>
+            </>
+          ) : null}
+        </View>
       ) : null}
     </View>
   );
@@ -239,6 +278,11 @@ export default function AppointmentsScreen(): React.JSX.Element {
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [completingId, setCompletingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [undoBanner, setUndoBanner] = useState<{
+    patientId: string;
+    appointmentId: string;
+    hospitalName: string;
+  } | null>(null);
 
   const attendeeOptions = useMemo<AttendeeOption[]>(() => {
     const fromMembers: AttendeeOption[] = [];
@@ -264,15 +308,26 @@ export default function AppointmentsScreen(): React.JSX.Element {
     return subscribeAppointments(patientId, setAppointments);
   }, [patientId]);
 
-  const { upcoming, past } = useMemo(() => {
-    const upcomingList = appointments
-      .filter(a => a.status === 'SCHEDULED' || a.status === 'ATTEND')
+  const { needsUpdate, upcoming, past } = useMemo(() => {
+    const nowMs = Date.now();
+    const open = appointments.filter(a => a.status === 'SCHEDULED' || a.status === 'ATTEND');
+    const overdueList = open
+      .filter(a => timeOf(a) > 0 && timeOf(a) < nowMs)
+      .sort((a, b) => timeOf(a) - timeOf(b));
+    const upcomingList = open
+      .filter(a => timeOf(a) === 0 || timeOf(a) >= nowMs)
       .sort((a, b) => timeOf(a) - timeOf(b));
     const pastList = appointments
-      .filter(a => a.status === 'COMPLETED' || a.status === 'CANCELLED')
+      .filter(a => a.status === 'COMPLETED' || a.status === 'CANCELLED' || a.status === 'MISSED')
       .sort((a, b) => timeOf(b) - timeOf(a));
-    return { upcoming: upcomingList, past: pastList };
+    return { needsUpdate: overdueList, upcoming: upcomingList, past: pastList };
   }, [appointments]);
+
+  const isScheduledInPast = useMemo(() => {
+    if (!form.scheduledAt) return false;
+    const ms = Date.parse(form.scheduledAt);
+    return !Number.isNaN(ms) && ms < Date.now();
+  }, [form.scheduledAt]);
 
   const selected = useMemo<Appointment | null>(
     () => appointments.find(a => a.id === selectedId) ?? null,
@@ -293,17 +348,55 @@ export default function AppointmentsScreen(): React.JSX.Element {
   }
 
   async function handleQuickComplete(appointment: Appointment): Promise<void> {
-    if (!patientId || !actor) return;
+    const targetPatientId = appointment.patientId || patientId;
+    if (!targetPatientId || !actor) return;
     setCompletingId(appointment.id);
     setActionError(null);
     try {
-      await completeAppointment(patientId, appointment.id, actor, {
+      await completeAppointment(targetPatientId, appointment.id, actor, {
         actualAttendedById: appointment.assignedAttendeeId || actor.uid,
+        expectedVersion: appointment.version ?? 1,
+        clientMutationId: `mut_${appointment.id}_${Date.now()}`,
       });
+      setUndoBanner({
+        patientId: targetPatientId,
+        appointmentId: appointment.id,
+        hospitalName: appointment.hospitalName,
+      });
+      setTimeout(() => {
+        setUndoBanner(prev => (prev?.appointmentId === appointment.id ? null : prev));
+      }, 6000);
     } catch (err: unknown) {
       setActionError(errorMessage(err));
     } finally {
       setCompletingId(null);
+    }
+  }
+
+  async function handleUndoComplete(): Promise<void> {
+    if (!undoBanner || !actor) return;
+    const target = undoBanner;
+    setUndoBanner(null);
+    try {
+      await revertAppointmentToScheduled(target.patientId, target.appointmentId, actor);
+    } catch (err: unknown) {
+      setActionError(errorMessage(err));
+    }
+  }
+
+  async function handleQuickMissed(appointment: Appointment): Promise<void> {
+    const targetPatientId = appointment.patientId || patientId;
+    if (!targetPatientId || !actor) return;
+    setActionError(null);
+    try {
+      await markAppointmentMissed(
+        targetPatientId,
+        appointment.id,
+        actor,
+        appointment.version ?? 1,
+      );
+    } catch (err: unknown) {
+      setActionError(errorMessage(err));
     }
   }
 
@@ -427,6 +520,11 @@ export default function AppointmentsScreen(): React.JSX.Element {
               error={formErrors.scheduledAt}
               mode="datetime"
             />
+            {isScheduledInPast ? (
+              <Text style={styles.pastWarning}>
+                Selected time is in the past — logging as a retrospective / walk-in visit.
+              </Text>
+            ) : null}
 
             <Text style={styles.fieldLabel}>Booked by (required)</Text>
             <View style={styles.chipWrap}>
@@ -528,6 +626,54 @@ export default function AppointmentsScreen(): React.JSX.Element {
           </View>
         ) : null}
 
+        {undoBanner ? (
+          <View style={styles.undoBanner}>
+            <Text style={styles.undoText}>
+              {`Marked ${undoBanner.hospitalName} as Completed.`}
+            </Text>
+            {canEdit ? (
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => void handleUndoComplete()}
+                style={styles.undoButton}>
+                <Text style={styles.undoButtonText}>Undo</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        ) : null}
+
+        {needsUpdate.length > 0 ? (
+          <View style={[styles.section, styles.needsUpdateSection]}>
+            <Text style={styles.needsUpdateTitle}>Needs Update</Text>
+            {needsUpdate.map(appointment => {
+              const isAssigned = Boolean(appointment.assignedAttendeeId);
+              const isAssignedToMe = Boolean(
+                appointment.assignedAttendeeId &&
+                  currentUser &&
+                  appointment.assignedAttendeeId === currentUser.id,
+              );
+              const isAssignedToOther = Boolean(isAssigned && !isAssignedToMe);
+              const canQuickComplete =
+                actor !== null && (isAssignedToMe || (!isAssigned && canEdit));
+              return (
+                <AppointmentRow
+                  key={appointment.id}
+                  appointment={appointment}
+                  attendeeLabel={attendeeLabel(appointment.assignedAttendeeId)}
+                  isAssignedToMe={isAssignedToMe}
+                  isAssignedToOther={isAssignedToOther}
+                  canQuickComplete={canQuickComplete}
+                  canEditActions={canEdit}
+                  completing={completingId === appointment.id}
+                  onQuickComplete={() => void handleQuickComplete(appointment)}
+                  onMarkMissed={() => void handleQuickMissed(appointment)}
+                  onPress={() => setSelectedId(appointment.id)}
+                />
+              );
+            })}
+          </View>
+        ) : null}
+
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Upcoming</Text>
           {actionError ? (
@@ -556,6 +702,7 @@ export default function AppointmentsScreen(): React.JSX.Element {
                   isAssignedToMe={isAssignedToMe}
                   isAssignedToOther={isAssignedToOther}
                   canQuickComplete={canQuickComplete}
+                  canEditActions={canEdit}
                   completing={completingId === appointment.id}
                   onQuickComplete={() => void handleQuickComplete(appointment)}
                   onPress={() => setSelectedId(appointment.id)}
@@ -582,6 +729,7 @@ export default function AppointmentsScreen(): React.JSX.Element {
                 )}
                 isAssignedToOther={false}
                 canQuickComplete={false}
+                canEditActions={canEdit}
                 completing={false}
                 onQuickComplete={() => {}}
                 onPress={() => setSelectedId(appointment.id)}
@@ -789,5 +937,109 @@ const styles = StyleSheet.create({
   },
   disabled: {
     opacity: 0.5,
+  },
+  chipCluster: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  syncBadge: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: colors.amber,
+  },
+  notesLaterPill: {
+    alignSelf: 'flex-start',
+    marginTop: 6,
+    borderWidth: 1,
+    borderColor: colors.amber,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    backgroundColor: '#FFFBEB',
+  },
+  notesLaterText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: colors.amber,
+  },
+  inlineActionRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 4,
+  },
+  secondaryInlineButton: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: colors.primary,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: colors.card,
+  },
+  secondaryInlineButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.primary,
+  },
+  dangerInlineButton: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: colors.error,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: colors.card,
+  },
+  dangerInlineButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.error,
+  },
+  needsUpdateSection: {
+    borderColor: colors.amber,
+  },
+  needsUpdateTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: colors.amber,
+    marginBottom: 10,
+  },
+  pastWarning: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.amber,
+    marginTop: -4,
+    marginBottom: 8,
+  },
+  undoBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: colors.textPrimary,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginBottom: 12,
+  },
+  undoText: {
+    flex: 1,
+    color: colors.card,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  undoButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: colors.primary,
+  },
+  undoButtonText: {
+    color: colors.card,
+    fontSize: 13,
+    fontWeight: '700',
   },
 });

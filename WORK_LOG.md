@@ -403,7 +403,38 @@ Pending next:
 - Firestore rules and indexes.
 - Firebase Storage upload for record attachments.
 - Set isSyntheticDemo on seeded documents if the schema is extended.
-- WORK_LOG has duplicate [Prompt #2] and [Prompt #7] headings from earlier runs; not renumbered.
+- Pending next: ... (see Prompt #9 below)
 
-Hackathon demo readiness: code-complete for the requested slice and type-clean; demo-ready only after a manual run on a simulator, since no runtime check has occurred. Synthetic data only; no medical advice text.
+---
+### [Prompt #9] — [2026-11-22 21:15]
+- **Prompt Summary:** Implement comprehensive edge-case handling for CareBridge appointment scheduling, completion, and post-visit updates (concurrent conflicts, offline idempotency, overdue "Needs Update" handling, in-place rescheduling, undo/revert, post-visit edits with attachment validation, follow-up child appointments, explicit `patientId` binding, and reminder cancellation/rescheduling).
+- **Context Checked:** Confirmed `AGENT_INSTRUCTIONS.md`, `ARCHITECTURE_AND_DB.md`, and prior `WORK_LOG.md` entries.
+- **Files Changed & Reasons:**
+  1. `src/services/notificationService.ts` (`CREATED`)
+     - **Changes:** Added `scheduleAppointmentReminder`, `cancelAppointmentReminder`, `getAppointmentReminder`, and `clearAllAppointmentReminders`.
+     - **Reason:** Immediately cancels or reschedules pending appointment reminder jobs on completion, cancellation, missed status, or reschedule, prioritizing `assignedAttendeeId` when set.
+  2. `src/types/carebridge.ts` (`MODIFIED`)
+     - **Changes:** Added `'MISSED'` to `AppointmentStatus` and added `completedAt`, `completedBy`, `completedByName`, `updatedBy`, `updatedByName`, `lastEditedStamp`, `version`, `parentAppointmentId`, `rescheduleCount`, `rescheduledBy`, `rescheduleReason`, `syncStatus`, `clientMutationId`, `visitNotes`, and `attachments` to `Appointment`.
+     - **Reason:** Supports optimistic concurrency, audit preservation, follow-up linkage, and offline sync status.
+  3. `src/services/dashboardSelectors.ts` (`MODIFIED`)
+     - **Changes:** Updated `AppointmentStatus` and `pickNextAppointment` to ignore `'MISSED'` alongside `'COMPLETED'` and `'CANCELLED'`.
+     - **Reason:** Prevents missed appointments from showing as the next upcoming appointment.
+  4. `src/services/localStore.ts` (`MODIFIED`)
+     - **Changes:** Added `saveAppointmentDraftNotes`, `getAppointmentDraftNotes`, `hasProcessedMutation`, `markMutationProcessed`, `queueOfflineMutation`, and `getPendingOfflineMutations`.
+     - **Reason:** Preserves unsaved post-visit notes across concurrent schedule changes and tracks idempotent offline mutations.
+  5. `src/services/appointmentService.ts` (`MODIFIED`)
+     - **Changes:** Added `AppointmentConflictError`, `rescheduleAppointment`, `markAppointmentMissed`, `revertAppointmentToScheduled`, `updateCompletedAppointment`, `flushOfflineAppointmentMutation`, optimistic `version` checks, `clientMutationId` idempotency, image attachment validation via `imageCompression.ts`, child follow-up creation (`parentAppointmentId`), and reminder hooks.
+     - **Reason:** Handles all concurrency, offline, rescheduling, completion, post-visit edit, and reminder edge cases atomically.
+  6. `src/components/AppointmentPhaseModal.tsx` (`MODIFIED`)
+     - **Changes:** Bound writes to `appointment.patientId`, added conflict & draft-notes banners, reschedule + missed actions, `"Add visit notes later"` pill, `"View / Add Extra Notes"` with validated attachments & follow-up toggle, and `"Revert to Scheduled (Undo)"`.
+     - **Reason:** Exposes safe conflict resolution, rescheduling, post-visit updates, and undo controls in the appointment modal.
+  7. `src/screens/AppointmentsScreen.tsx` (`MODIFIED`)
+     - **Changes:** Added **Needs Update** section for overdue visits with 1-tap **Mark as Completed**, **Reschedule**, and **Missed** buttons; added 6-second **Undo** toast banner; added past-time walk-in warning; added `"Syncing..."` and `"Add visit notes later"` pills.
+     - **Reason:** Surfaces overdue visits, undo recovery, retrospective visit warnings, and sync indicators cleanly.
+  8. `__tests__/fullAppFlow.test.tsx` (`MODIFIED`)
+     - **Changes:** Added test `#5` covering concurrency conflict errors, in-place rescheduling, offline `clientMutationId` idempotency/flush, post-visit updates with attachment validation & child follow-up (`parentAppointmentId`), undo/revert, missed status, and reminder cancellation/rescheduling.
+     - **Reason:** Verifies all appointment edge cases end-to-end.
+- **DB / State / Logic Notes:** All appointment mutations use atomic `writeBatch` writes under `patients/{patientId}/appointments/{appointmentId}` and `patients/{patientId}/activityLogs/{logId}` with optimistic `version` counters.
+- **Pending Next:** Verify on iOS/Android device or simulator and push to Git.
+---
 
